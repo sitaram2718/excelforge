@@ -970,7 +970,11 @@ class WebHandler(BaseHTTPRequestHandler):
         i=int(d.get('index',0));STATE['result'].rows=sort_rows(STATE['result'].rows,[(i,bool(d.get('desc',False)))]);return self.js(self.state(STATE['selected'],'Sorted table.'))
     def state(self,selected='',status=''):
         tb=STATE['result'];stats=''
-        if tb and tb.rows:2}  count={len(v)}')
+        if tb and tb.rows:
+            L=['','QUICK STATS (numeric columns):']
+            for j,c in enumerate(tb.cols):
+                v=[r[j] for r in tb.rows if isinstance(r[j],float)]
+                if v and tb.is_num_col(j):L.append(f'  {c}: sum={sum(v):,.2f}  avg={sum(v)/len(v):,.2f}  min={min(v):g}  max={max(v):g}  count={len(v)}')
             L+=['','COLUMN PROFILE:']+[f"  {c}: {'numeric' if tb.is_num_col(j) else 'text'}, missing={sum(1 for r in tb.rows if r[j]=='')}, unique={len({r[j] for r in tb.rows})}" for j,c in enumerate(tb.cols)]
             stats='\n'+'\n'.join(L)
         return {'sheets':list(STATE['sheets']),'selected':selected,'result':None if tb is None else {'cols':tb.cols,'rows':[[v for v in r] for r in tb.rows[:5000]],'row_count':len(tb.rows),'col_count':len(tb.cols),'truncated':len(tb.rows)>5000},'steps':STATE['steps'],'stats':stats,'status':status}
