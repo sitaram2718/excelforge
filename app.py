@@ -349,7 +349,7 @@ class Engine:
     def run(self, prompt, tb):
         # Let an AI model interpret the request, then apply its structured plan
         # locally. Cell values are not sent; only the prompt and column names are.
-        api_key = os.environ.get('GEMINI_API_KEY', 'AQ.Ab8RN6LvKRCgEQ3UwtN3JJkyGnyISwdfJG5CzehplbnIPJbD6w').strip()
+        api_key = os.environ.get('GEMINI_API_KEY', '').strip()
         if not api_key:
             raise RuntimeError('Gemini mode requires GEMINI_API_KEY. Set it in the environment before starting ExcelForge.')
         plan = self.ai_plan(prompt, tb, api_key)
