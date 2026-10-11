@@ -1,4 +1,4 @@
-import sys, os, re, io, csv, math, random, zipfile, datetime, statistics, difflib, textwrap, subprocess
+import sys, os, re, io, csv, math, random, zipfile, datetime, statistics, difflib, textwrap, subprocess, time, json
 from collections import Counter
 import xml.etree.ElementTree as ET
 import urllib.request, urllib.error
@@ -347,13 +347,18 @@ TOPR = re.compile(r'\b(top|first|best|bottom|last|worst|lowest|smallest|highest|
 class Engine:
 
     def run(self, prompt, tb):
-        # Let an AI model interpret the request, then apply its structured plan
-        # locally. Cell values are not sent; only the prompt and column names are.
         api_key = os.environ.get('GEMINI_API_KEY', '').strip()
         if not api_key:
-            raise RuntimeError('Gemini mode requires GEMINI_API_KEY. Set it in the environment before starting ExcelForge.')
-        plan = self.ai_plan(prompt, tb, api_key)
-        return self.apply_plan(prompt, tb, plan)
+            # Fall back to offline rule parser directly if no key is present
+            return self.run_rules(prompt, tb)
+        try:
+            plan = self.ai_plan(prompt, tb, api_key)
+            return self.apply_plan(prompt, tb, plan)
+        except Exception as e:
+            # Graceful fallback: when Gemini has capacity issues (503), rate limits, or network errors,
+            # execute via the rule-based engine instead of breaking the entire app.
+            rtb, rsteps = self.run_rules(prompt, tb)
+            return rtb, [f"⚡ Note: Gemini API temporarily unavailable ({e}). Fallback to local rule engine executed."] + rsteps
 
     def ai_plan(self, prompt, tb, api_key):
         schema = {
@@ -386,20 +391,37 @@ class Engine:
             'contents': [{'role': 'user', 'parts': [{'text': json.dumps({'request': prompt, 'columns': tb.cols}, ensure_ascii=False)}]}],
             'generationConfig': {'responseMimeType': 'application/json', 'responseSchema': schema, 'temperature': 0}
         }
-        model = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
+        model = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
         req = urllib.request.Request(f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent',
             data=json.dumps(payload).encode('utf-8'), headers={'x-goog-api-key': api_key, 'Content-Type': 'application/json'}, method='POST')
-        try:
-            with urllib.request.urlopen(req, timeout=60) as response: raw = response.read()
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode('utf-8', 'replace')[:500]
-            raise RuntimeError(f'Gemini API error ({e.code}): {detail}')
-        except Exception as e:
-            raise RuntimeError(f'Could not reach Gemini: {e}')
+
+        raw = None
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                with urllib.request.urlopen(req, timeout=45) as response:
+                    raw = response.read()
+                break
+            except urllib.error.HTTPError as e:
+                # Retry on transient server overloads (503), server errors (500), or rate limits (429)
+                if e.code in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                detail = e.read().decode('utf-8', 'replace')[:400]
+                raise RuntimeError(f'Gemini API error ({e.code}): {detail}')
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                raise RuntimeError(f'Could not reach Gemini: {e}')
+
         data = json.loads(raw.decode('utf-8'))
-        try: content = ''.join(part.get('text', '') for part in data['candidates'][0]['content']['parts'])
-        except Exception: raise RuntimeError('Gemini returned no text. Check the model, key, and API access.')
+        try:
+            content = ''.join(part.get('text', '') for part in data['candidates'][0]['content']['parts'])
+        except Exception:
+            raise RuntimeError('Gemini returned no text. Check model configuration, quota, and key.')
         return json.loads(content)
+
     def apply_plan(self, prompt, tb, plan):
         if not plan.get('understood'):
             raise RuntimeError(plan.get('explanation') or 'The AI could not interpret this request.')
@@ -450,7 +472,6 @@ class Engine:
         
         for c in clauses:
             try:
-                prev_steps_len = len(steps)
                 tb = self.clause(tb, c, steps)
             except Exception as ex:
                 steps.append(f"⚠ Could not apply '{c}' ({type(ex).__name__}). Data left unchanged for that step.")
@@ -648,7 +669,7 @@ class Engine:
         if conds:
             cur = Table(cols, [r for r in tb.rows if row_ok(r, conds)])
             steps.append(f"Filter rows where {describe_conds(conds, tb)} → {len(cur.rows)} of {len(tb.rows)} rows")
-        sort_hits, send, sdef = [], len(tl), False
+        sort_hits, send = [], len(tl)
         sm = re.search(r'\b(sort|sorted|order|ordered|arrange|arranged|rank|ranked)\b', tl)
         if sm:
             k = re.search(r'\b(show|display|list|select|give|get|print|where|whose|limit|top|bottom|group|having|only)\b', tl[sm.end():])
@@ -848,7 +869,7 @@ def chart_data(tb):
 # ======================================================================
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
-import tempfile, json, mimetypes
+import tempfile, mimetypes
 
 HOST='0.0.0.0'
 PORT=int(os.environ.get('PORT','10000'))
@@ -881,8 +902,7 @@ async function sortCol(i){sorts[i]=!sorts[i];let r=await fetch('/sort',{method:'
 function show(x){$('table').classList.toggle('active',x==='table');$('chart').classList.toggle('active',x==='chart')}
 function setTableZoom(z){tableZoom=Math.max(.6,Math.min(2.0,z));applyTableZoom()}
 function changeTableZoom(delta){setTableZoom(tableZoom+delta)}
-function applyTableZoom(){let t=document.querySelector('.table');if(!t)return;t.style.zoom=tableZoom;let tw=$('tablewrap');tw.style.setProperty('--table-zoom',tableZoom);}
-$('tablewrap').addEventListener('wheel',e=>{if(e.ctrlKey){e.preventDefault();changeTableZoom(e.deltaY<0?.1:-.1)}},{passive:false});
+function applyTableZoom(){let t=document.querySelector('.table');if(!t)return;t.style.zoom=tableZoom;let tw=$('tablewrap');tw.style.setProperty('--table-zoom',tableZoom);}$('tablewrap').addEventListener('wheel',e=>{if(e.ctrlKey){e.preventDefault();changeTableZoom(e.deltaY<0?.1:-.1)}},{passive:false});
 function startColumnResize(e,i){e.preventDefault();e.stopPropagation();let th=e.currentTarget.parentElement,startX=e.clientX,startW=th.getBoundingClientRect().width;th.classList.add('resizing');document.body.style.userSelect='none';let move=ev=>{let w=Math.max(55,startW+(ev.clientX-startX));columnWidths[i]=Math.round(w/tableZoom);let col=document.querySelector(`col[data-col="${i}"]`);if(col)col.style.width=columnWidths[i]+'px';let t=document.querySelector('.table');if(t)t.style.width=(Object.keys(columnWidths).reduce((sum,k)=>sum+(columnWidths[k]||140),0))+'px'};let up=()=>{th.classList.remove('resizing');document.body.style.userSelect='';document.removeEventListener('mousemove',move);document.removeEventListener('mouseup',up);msg(`Column ${i+1} width adjusted.`)};document.addEventListener('mousemove',move);document.addEventListener('mouseup',up)}
 function dragWidth(el,min,max,axis){let dragging=false,start=0,startVal=0;el.addEventListener('mousedown',e=>{dragging=true;start=axis==='x'?e.clientX:e.clientY;startVal=axis==='x'?$('side').getBoundingClientRect().width:$('controls').getBoundingClientRect().height;el.classList.add('dragging');document.body.style.userSelect='none';e.preventDefault()});document.addEventListener('mousemove',e=>{if(!dragging)return;let d=(axis==='x'?e.clientX:e.clientY)-start;if(axis==='x'){let ws=$('workspace'),rect=ws.getBoundingClientRect();let sideW=Math.max(min,Math.min(Math.min(max,rect.width-500-7),startVal+d));ws.style.gridTemplateColumns=sideW+'px 7px minmax(500px,1fr)'}else{let side=$('side'),rect=side.getBoundingClientRect(),h=Math.max(min,Math.min(Math.min(max,rect.height-150-7),startVal+d));$('controls').style.flex='0 0 '+h+'px';$('controls').style.height=h+'px'}});document.addEventListener('mouseup',()=>{if(!dragging)return;dragging=false;el.classList.remove('dragging');document.body.style.userSelect='';drawChart()})}
 dragWidth($('splitter'),280,650,'x');dragWidth($('vsplit'),250,900,'y');
@@ -958,8 +978,10 @@ class WebHandler(BaseHTTPRequestHandler):
         p=str(d.get('prompt','')).strip()
         if not p:return self.js({'error':'Type a request first.'},400)
         start=STATE['result'] if d.get('chain') and STATE['result'] is not None else STATE['base']
-        try:r,steps=STATE['eng'].run(p,start)
-        except Exception as e:r,steps=start,[f'⚠ AI request failed: {e}']
+        try:
+            r,steps=STATE['eng'].run(p,start)
+        except Exception as e:
+            r,steps=start,[f'⚠ Request processing failed: {e}']
         steps.append(f'Result: {len(r.rows)} rows × {len(r.cols)} columns');STATE['result']=r;STATE['steps']=steps;STATE['prompt_used']=p
         return self.js(self.state(STATE['selected'],('Done – ' if r.rows else 'No rows matched – ')+(steps[0] if steps else 'Done')))
     def reset(self):
