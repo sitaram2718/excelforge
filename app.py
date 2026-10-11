@@ -2,6 +2,9 @@ import sys, os, re, io, csv, math, random, zipfile, datetime, statistics, diffli
 from collections import Counter
 import xml.etree.ElementTree as ET
 import urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+import tempfile, json, mimetypes
 
 REQUIRED = []   # 100% standard library
 def ensure_requirements():
@@ -347,8 +350,6 @@ TOPR = re.compile(r'\b(top|first|best|bottom|last|worst|lowest|smallest|highest|
 class Engine:
 
     def run(self, prompt, tb):
-        # Let an AI model interpret the request, then apply its structured plan
-        # locally. Cell values are not sent; only the prompt and column names are.
         api_key = os.environ.get('GEMINI_API_KEY', '').strip()
         if not api_key:
             raise RuntimeError('Gemini mode requires GEMINI_API_KEY. Set it in the environment before starting ExcelForge.')
@@ -386,7 +387,7 @@ class Engine:
             'contents': [{'role': 'user', 'parts': [{'text': json.dumps({'request': prompt, 'columns': tb.cols}, ensure_ascii=False)}]}],
             'generationConfig': {'responseMimeType': 'application/json', 'responseSchema': schema, 'temperature': 0}
         }
-        model = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
+        model = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
         req = urllib.request.Request(f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent',
             data=json.dumps(payload).encode('utf-8'), headers={'x-goog-api-key': api_key, 'Content-Type': 'application/json'}, method='POST')
         try:
@@ -400,6 +401,7 @@ class Engine:
         try: content = ''.join(part.get('text', '') for part in data['candidates'][0]['content']['parts'])
         except Exception: raise RuntimeError('Gemini returned no text. Check the model, key, and API access.')
         return json.loads(content)
+
     def apply_plan(self, prompt, tb, plan):
         if not plan.get('understood'):
             raise RuntimeError(plan.get('explanation') or 'The AI could not interpret this request.')
@@ -447,10 +449,8 @@ class Engine:
         p = prompt.replace('“', '"').replace('”', '"').replace('’', "'").replace('‘', "'")
         p = re.sub(r'(\bif\b[^;\n]*?)\s+then\s+(?=[^;\n]*\b(?:else|otherwise)\b)', r'\1 → ', p, flags=re.I)
         clauses = [c.strip() for c in SPLIT.split(p) if c and c.strip()]
-
         for c in clauses:
             try:
-                prev_steps_len = len(steps)
                 tb = self.clause(tb, c, steps)
             except Exception as ex:
                 steps.append(f"⚠ Could not apply '{c}' ({type(ex).__name__}). Data left unchanged for that step.")
@@ -846,49 +846,337 @@ def chart_data(tb):
 # ======================================================================
 # WEB SHELL: same data engine, browser UI, single file, stdlib only.
 # ======================================================================
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
-import tempfile, json, mimetypes
 
 HOST='0.0.0.0'
 PORT=int(os.environ.get('PORT','10000'))
 STATE={'sheets':{},'base':None,'result':None,'steps':[],'prompt_used':'','selected':'','eng':Engine()}
 
 HTML = r"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Excel Intelligence</title>
-<style>
-*{box-sizing:border-box}html,body{height:100%;margin:0;font-family:"Segoe UI",Arial,sans-serif;background:#eef1f7;color:#111827}body{overflow:hidden;min-width:1050px}
-.nav{height:42px;background:#075985;color:#fff;display:flex;align-items:center;padding:0 12px;gap:14px}.brand{font-size:15px;font-weight:700;white-space:nowrap}.sub{font-size:9px;font-style:italic;color:#dbeafe}.tools{display:flex;gap:6px}.grow{flex:1}
-.btn{border:0;border-radius:3px;background:#087dcc;color:#fff;font-weight:700;font-size:12px;padding:8px 12px;cursor:pointer}.btn.dark{background:#1e2a4a}.btn:hover{filter:brightness(1.08)}
-.workspace{height:calc(100vh - 66px);display:grid;grid-template-columns:360px 7px minmax(500px,1fr);gap:0;padding:5px}.side{background:#fff;display:flex;flex-direction:column;min-width:0;min-height:0}.splitter{background:#c7c7c7;cursor:col-resize;position:relative}.splitter:hover,.splitter.dragging{background:#075985}.splitter:after{content:"⋮";position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#777;font-size:16px}.controls{padding:12px 10px 6px;min-height:0;display:flex;flex-direction:column;overflow:hidden}.title{font-size:10px;font-weight:700;margin:0 2px 5px}.muted{font-size:8px;color:#6b7280;font-style:italic}.info{background:#f7f8f9;color:#374151;padding:9px;font-size:9px;min-height:55px;margin-bottom:10px}.select,.prompt{width:100%;border:1px solid #bbb;border-radius:2px;background:#fff}.select{height:32px;padding:4px;margin:2px 0 10px}.prompt{resize:vertical;flex:1 1 auto;min-height:105px;max-height:none;padding:8px;font:12px "Segoe UI";line-height:1.4;margin:3px 0}.prompt:focus{outline:2px solid #bfdbfe;border-color:#2f6fed}.run{margin-top:6px;width:100%;font-size:11px;padding:10px}.chain{font-size:9px;margin:3px 0 10px}.vsplit{height:7px;background:#c7c7c7;cursor:row-resize;flex:0 0 7px;position:relative}.vsplit:hover,.vsplit.dragging{background:#075985}.vsplit:after{content:"⋯";position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);color:#777;font-size:14px}.insights{flex:1;min-height:150px;background:#fbfcff;padding:8px;display:flex;flex-direction:column;overflow:hidden}.insights pre{flex:1;margin:0;overflow:auto;white-space:pre-wrap;font:9px Consolas,monospace}
-.main{min-width:0;background:#f4f4f2;display:flex;flex-direction:column}.tabs{height:42px;background:#deddd9;border:1px solid #bbb;display:flex;align-items:center;padding:3px;gap:5px;flex:0 0 42px}.ctype{width:75px;height:31px}.zoom-tools{display:none}.body{position:relative;flex:1;min-height:0;background:#fff;border:1px solid #bbb;overflow:hidden}.view{position:absolute;inset:0;display:none}.view.active{display:flex}.tablewrap{overflow:auto;width:100%;height:100%;position:relative;background:#fff}.table{border-collapse:separate;border-spacing:0;table-layout:fixed;font-size:12px;transform-origin:top left}.table th{position:sticky;top:0;z-index:3;background:#dfe6f5;border:1px solid #ccd3df;padding:6px 22px 6px 8px;text-align:left;white-space:nowrap;cursor:pointer;user-select:none;height:32px;position:sticky}.table td{border-right:1px solid #e2e6ee;border-bottom:1px solid #e2e6ee;padding:5px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background:#fff}.table tr:nth-child(odd) td{background:#f3f6fd}.table th,.table td{min-width:55px}.table th{position:sticky;relative:initial}.table th{position:sticky}.table th{--resize-hit:7px}.table .col-resizer{position:absolute;right:0;top:0;width:7px;height:100%;cursor:col-resize;z-index:5}.table th.resizing{background:#c8d8f2}.empty{height:100%;width:100%;display:grid;place-items:center;color:#888}.chart{width:100%;height:100%}.status{height:24px;background:#dbeafe;padding:4px 8px;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.drop{outline:3px solid #2f6fed;outline-offset:-3px}.file{display:none}.hint{font-size:8px;color:#6b7280;margin-left:5px;white-space:nowrap}.tablewrap.zooming{cursor:zoom-in}
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Excel Intelligence</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background-color: #f1f5f9; color: #1e293b; min-height: 100vh; }
+    .table-container { min-height: 380px; max-height: calc(100vh - 270px); overflow: auto; background: #fff; }
+    .table-custom { border-collapse: separate; border-spacing: 0; font-size: 12px; }
+    .table-custom th { position: sticky; top: 0; z-index: 3; background: #e2e8f0; border-bottom: 2px solid #cbd5e1; padding: 7px 22px 7px 8px; white-space: nowrap; cursor: pointer; user-select: none; }
+    .table-custom td { padding: 6px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 280px; }
+    .table-custom .col-resizer { position: absolute; right: 0; top: 0; width: 6px; height: 100%; cursor: col-resize; z-index: 5; }
+    .table-custom th.resizing { background: #cbd5e1; }
+    .view { display: none; width: 100%; height: 100%; min-height: 420px; }
+    .view.active { display: flex; flex-direction: column; }
+    .chart { width: 100%; height: 100%; min-height: 400px; }
+    .drop { outline: 3px dashed #0d6efd !important; outline-offset: -5px; }
+    .status-bar { font-size: 12px; background: #e0f2fe; color: #0369a1; }
+  </style>
+</head>
+<body class="d-flex flex-column">
 
-</style></head><body>
-<div class="nav"><div class="brand">▣&nbsp; EXCEL INTELLIGENCE</div><div class="sub">Natural-language spreadsheet engine</div><div class="tools"><button class="btn" onclick="$('files').click()">Upload Excel</button><button class="btn" onclick="resetApp()">Reset</button></div><div class="grow"></div><div class="tools"><button class="btn" onclick="location='/export/xlsx'">Export Excel</button><button class="btn" onclick="location='/export/pdf'">Export PDF Report</button></div><input id="files" class="file" type="file" multiple accept=".xlsx,.xlsm,.csv,.tsv,.txt"></div>
-<div id="workspace" class="workspace"><aside id="side" class="side"><div id="controls" class="controls"><div class="title">Dataset Info</div><div id="info" class="info"></div><div class="title">Sheet</div><select id="sheet" class="select" onchange="selectSheet(this.value)"><option>No file loaded</option></select><div class="title">Ask your Data</div><div class="muted">Describe what you want in plain English.</div><textarea id="prompt" class="prompt" placeholder="e.g. average salary by department"></textarea><button class="btn run" onclick="analyze()">▶&nbsp; ANALYZE &amp; EXECUTE</button><label class="chain"><input id="chain" type="checkbox"> Chain on previous result</label></div><div id="vsplit" class="vsplit" title="Drag to resize panels"></div><div class="insights"><div class="title">Insights &amp; Steps</div><pre id="insights"></pre></div></aside><div id="splitter" class="splitter" title="Drag to resize sidebar"></div>
-<main class="main"><div class="tabs"><button class="btn dark" onclick="show('table')">▦ Interactive Table</button><button class="btn dark" onclick="show('chart');drawChart()">Auto-Chart</button><select id="ctype" class="ctype" onchange="show('chart');drawChart()"><option>Bar</option><option>Line</option><option>Pie</option></select></div><div class="body"><div id="table" class="view active"><div id="tablewrap" class="tablewrap"></div></div><div id="chart" class="view"><canvas id="cv" class="chart"></canvas></div></div></main></div><div id="status" class="status">Ready. Upload an Excel/CSV file, type a request, and press ANALYZE &amp; EXECUTE.</div>
+<!-- Responsive Bootstrap Navbar -->
+<nav class="navbar navbar-expand-lg navbar-dark bg-primary shadow-sm px-3">
+  <div class="container-fluid p-0">
+    <a class="navbar-brand fw-bold fs-6 tracking-wide" href="#">▣ EXCEL INTELLIGENCE</a>
+    <span class="navbar-text d-none d-md-inline small text-light opacity-75 me-auto ms-2">Natural-language spreadsheet engine</span>
+    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navContent">
+      <span class="navbar-toggler-icon"></span>
+    </button>
+    <div class="collapse navbar-collapse justify-content-end" id="navContent">
+      <div class="d-flex flex-wrap gap-2 mt-2 mt-lg-0">
+        <button class="btn btn-sm btn-light fw-semibold" onclick="$('files').click()">Upload Excel/CSV</button>
+        <button class="btn btn-sm btn-outline-light" onclick="resetApp()">Reset</button>
+        <button class="btn btn-sm btn-success fw-semibold" onclick="location='/export/xlsx'">Export Excel</button>
+        <button class="btn btn-sm btn-danger fw-semibold" onclick="location='/export/pdf'">Export PDF</button>
+      </div>
+    </div>
+  </div>
+</nav>
+
+<input id="files" class="d-none" type="file" multiple accept=".xlsx,.xlsm,.csv,.tsv,.txt">
+
+<!-- Responsive Grid Container -->
+<div class="container-fluid py-3 flex-grow-1 d-flex flex-column" id="workspace">
+  <div class="row g-3 flex-grow-1">
+    
+    <!-- Left Column: Controls and Prompts (stacks full width on mobile/tablet, 4-cols on lg+) -->
+    <aside class="col-12 col-lg-4 col-xl-3 d-flex flex-column gap-3">
+      <div class="card shadow-sm border-0">
+        <div class="card-body p-3">
+          <label class="form-label fw-bold small mb-1">Dataset Info</label>
+          <div id="info" class="p-2 mb-3 bg-light border rounded small text-secondary" style="min-height: 48px;">No file loaded</div>
+
+          <label class="form-label fw-bold small mb-1">Sheet</label>
+          <select id="sheet" class="form-select form-select-sm mb-3" onchange="selectSheet(this.value)">
+            <option>No file loaded</option>
+          </select>
+
+          <label class="form-label fw-bold small mb-1">Ask your Data</label>
+          <div class="text-muted small mb-2 fst-italic">Describe what you want in plain English.</div>
+          <textarea id="prompt" class="form-control form-control-sm mb-2" rows="3" placeholder="e.g. average salary by department"></textarea>
+          
+          <button class="btn btn-primary btn-sm w-100 fw-bold py-2 mb-2" onclick="analyze()">▶ ANALYZE &amp; EXECUTE</button>
+          
+          <div class="form-check small">
+            <input class="form-check-input" id="chain" type="checkbox">
+            <label class="form-check-label" for="chain">Chain on previous result</label>
+          </div>
+        </div>
+      </div>
+
+      <div class="card shadow-sm border-0 flex-grow-1">
+        <div class="card-body p-3 d-flex flex-column">
+          <label class="form-label fw-bold small mb-2">Insights &amp; Steps</label>
+          <pre id="insights" class="p-2 bg-light border rounded small font-monospace flex-grow-1 mb-0" style="min-height: 140px; max-height: 250px; overflow-y: auto; white-space: pre-wrap;"></pre>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Right Column: Interactive Data Display -->
+    <main class="col-12 col-lg-8 col-xl-9 d-flex flex-column">
+      <div class="card shadow-sm border-0 flex-grow-1 d-flex flex-column">
+        <div class="card-header bg-white border-bottom py-2 px-3 d-flex flex-wrap align-items-center justify-content-between gap-2">
+          <div class="btn-group btn-group-sm" role="group">
+            <button class="btn btn-outline-dark active" id="btn-tab-table" onclick="show('table')">▦ Interactive Table</button>
+            <button class="btn btn-outline-dark" id="btn-tab-chart" onclick="show('chart');drawChart()">Auto-Chart</button>
+          </div>
+          <div class="d-flex align-items-center gap-2">
+            <span class="small text-muted d-none d-sm-inline">Chart Type:</span>
+            <select id="ctype" class="form-select form-select-sm w-auto" onchange="show('chart');drawChart()">
+              <option>Bar</option>
+              <option>Line</option>
+              <option>Pie</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="card-body p-0 position-relative flex-grow-1 d-flex flex-column">
+          <div id="table" class="view active flex-grow-1">
+            <div id="tablewrap" class="table-container table-responsive w-100 h-100">
+              <div class="d-flex align-items-center justify-content-center h-100 text-muted py-5">Load data to see the table</div>
+            </div>
+          </div>
+          <div id="chart" class="view flex-grow-1 p-2">
+            <canvas id="cv" class="chart w-100 h-100"></canvas>
+          </div>
+        </div>
+      </div>
+    </main>
+
+  </div>
+</div>
+
+<!-- Status Bar -->
+<footer id="status" class="status-bar px-3 py-2 border-top text-truncate">
+  Ready. Upload an Excel/CSV file, type a request, and press ANALYZE &amp; EXECUTE.
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/umd/bootstrap.bundle.min.js"></script>
 <script>
 const $=x=>document.getElementById(x);let state=null,sorts={},tableZoom=1,columnWidths={};
-function msg(x){$('status').textContent=x}function esc(x){return String(x??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
-$('files').onchange=async e=>{if(!e.target.files.length)return;let f=new FormData();[...e.target.files].forEach(x=>f.append('files',x));msg('Uploading and reading workbook…');try{let r=await fetch('/upload',{method:'POST',body:f}),d=await r.json();if(!r.ok)throw Error(d.error);render(d);msg(d.status)}catch(x){msg(x.message)}e.target.value=''};
+function msg(x){$('status').textContent=x}
+function esc(x){return String(x??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+
+$('files').onchange=async e=>{
+  if(!e.target.files.length)return;
+  let f=new FormData();
+  [...e.target.files].forEach(x=>f.append('files',x));
+  msg('Uploading and reading workbook…');
+  try{
+    let r=await fetch('/upload',{method:'POST',body:f}),d=await r.json();
+    if(!r.ok)throw Error(d.error);
+    render(d);
+    msg(d.status);
+  }catch(x){msg(x.message)}
+  e.target.value='';
+};
+
 $('prompt').onkeydown=e=>{if(e.ctrlKey&&e.key==='Enter')analyze()};
-async function selectSheet(name){try{let r=await fetch('/sheet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})}),d=await r.json();if(!r.ok)throw Error(d.error);render(d);msg(d.status)}catch(x){msg(x.message)}}
-async function analyze(){let p=$('prompt').value.trim();if(!p){msg('Type a request first.');return}msg('Analyzing…');try{let r=await fetch('/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p,chain:$('chain').checked})}),d=await r.json();if(!r.ok)throw Error(d.error);render(d);msg(d.status)}catch(x){msg(x.message)}}
-async function resetApp(){let r=await fetch('/reset',{method:'POST'}),d=await r.json();render(d);msg(d.status)}
-function render(d){state=d;let s=$('sheet');s.innerHTML='';(d.sheets||[]).forEach(n=>{let o=document.createElement('option');o.value=n;o.textContent=n;s.appendChild(o)});if(d.selected)s.value=d.selected;$('info').textContent=d.result?`${d.result.row_count} rows × ${d.result.col_count} cols${d.result.truncated?'  (showing first 5000)':''}  | drag column edges to resize | Ctrl+wheel to zoom`:'';let tb=d.result;if(!tb||!tb.cols.length){$('tablewrap').innerHTML='<div class="empty">Load data to see the table</div>'}else{let colgroup='<colgroup>'+tb.cols.map((c,i)=>`<col data-col="${i}" style="width:${columnWidths[i]||140}px">`).join('')+'</colgroup>';let heads=tb.cols.map((c,i)=>`<th data-col="${i}" onclick="sortCol(${i})">${esc(c)} ${sorts[i]===true?'↓':sorts[i]===false?'↑':''}<span class="col-resizer" onmousedown="startColumnResize(event,${i})"></span></th>`).join('');$('tablewrap').innerHTML=`<table class="table">${colgroup}<thead><tr>${heads}</tr></thead><tbody>${tb.rows.map(r=>'<tr>'+r.map(v=>`<td>${esc(v)}</td>`).join('')+'</tr>').join('')}</tbody></table>`;applyTableZoom();}
-$('insights').textContent=(d.steps||[]).map((x,i)=>`${i+1}. ${x}`).join('\n')+(d.stats||'');drawChart()}
-async function sortCol(i){sorts[i]=!sorts[i];let r=await fetch('/sort',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i,desc:sorts[i]})}),d=await r.json();render(d)}
-function show(x){$('table').classList.toggle('active',x==='table');$('chart').classList.toggle('active',x==='chart')}
-function setTableZoom(z){tableZoom=Math.max(.6,Math.min(2.0,z));applyTableZoom()}
-function changeTableZoom(delta){setTableZoom(tableZoom+delta)}
-function applyTableZoom(){let t=document.querySelector('.table');if(!t)return;t.style.zoom=tableZoom;let tw=$('tablewrap');tw.style.setProperty('--table-zoom',tableZoom);}
-$('tablewrap').addEventListener('wheel',e=>{if(e.ctrlKey){e.preventDefault();changeTableZoom(e.deltaY<0?.1:-.1)}},{passive:false});
-function startColumnResize(e,i){e.preventDefault();e.stopPropagation();let th=e.currentTarget.parentElement,startX=e.clientX,startW=th.getBoundingClientRect().width;th.classList.add('resizing');document.body.style.userSelect='none';let move=ev=>{let w=Math.max(55,startW+(ev.clientX-startX));columnWidths[i]=Math.round(w/tableZoom);let col=document.querySelector(`col[data-col="${i}"]`);if(col)col.style.width=columnWidths[i]+'px';let t=document.querySelector('.table');if(t)t.style.width=(Object.keys(columnWidths).reduce((sum,k)=>sum+(columnWidths[k]||140),0))+'px'};let up=()=>{th.classList.remove('resizing');document.body.style.userSelect='';document.removeEventListener('mousemove',move);document.removeEventListener('mouseup',up);msg(`Column ${i+1} width adjusted.`)};document.addEventListener('mousemove',move);document.addEventListener('mouseup',up)}
-function dragWidth(el,min,max,axis){let dragging=false,start=0,startVal=0;el.addEventListener('mousedown',e=>{dragging=true;start=axis==='x'?e.clientX:e.clientY;startVal=axis==='x'?$('side').getBoundingClientRect().width:$('controls').getBoundingClientRect().height;el.classList.add('dragging');document.body.style.userSelect='none';e.preventDefault()});document.addEventListener('mousemove',e=>{if(!dragging)return;let d=(axis==='x'?e.clientX:e.clientY)-start;if(axis==='x'){let ws=$('workspace'),rect=ws.getBoundingClientRect();let sideW=Math.max(min,Math.min(Math.min(max,rect.width-500-7),startVal+d));ws.style.gridTemplateColumns=sideW+'px 7px minmax(500px,1fr)'}else{let side=$('side'),rect=side.getBoundingClientRect(),h=Math.max(min,Math.min(Math.min(max,rect.height-150-7),startVal+d));$('controls').style.flex='0 0 '+h+'px';$('controls').style.height=h+'px'}});document.addEventListener('mouseup',()=>{if(!dragging)return;dragging=false;el.classList.remove('dragging');document.body.style.userSelect='';drawChart()})}
-dragWidth($('splitter'),280,650,'x');dragWidth($('vsplit'),250,900,'y');
-function drawChart(){let c=$('cv'),ctx=c.getContext('2d'),tb=state&&state.result;if(!tb||!tb.rows.length)return;let r=c.getBoundingClientRect(),D=devicePixelRatio||1;c.width=Math.max(400,r.width*D);c.height=Math.max(300,r.height*D);ctx.setTransform(D,0,0,D,0,0);let W=r.width,H=r.height;ctx.clearRect(0,0,W,H);let nums=[],texts=[];tb.cols.forEach((x,j)=>{let n=tb.rows.filter(a=>typeof a[j]==='number').length,e=tb.rows.filter(a=>String(a[j])!=='').length;if(e&&n>=.6*e)nums.push(j);else texts.push(j)});let lab=texts.find(j=>new Set(tb.rows.map(a=>String(a[j]))).size<=30);let vs=nums.filter(j=>j!==lab).slice(0,3);if(!vs.length)vs=[null];let labels=[],m=new Map();tb.rows.forEach((a,i)=>{let k=lab===undefined?String(i+1):String(a[lab]);if(!m.has(k)){m.set(k,vs.map(()=>0));labels.push(k)}vs.forEach((j,z)=>m.get(k)[z]+=j===null?1:(typeof a[j]==='number'?a[j]:0))});if(labels.length>30){let ix=labels.map((x,i)=>i).sort((a,b)=>m.get(labels[b])[0]-m.get(labels[a])[0]).slice(0,30);labels=ix.map(i=>labels[i])}let ser=vs.map((j,z)=>({n:j===null?'Count':tb.cols[j],v:labels.map(k=>m.get(k)[z])})),all=ser.flatMap(s=>s.v),lo=Math.min(0,...all),hi=Math.max(1,...all),L=65,R=25,T=50,B=70,pw=W-L-R,ph=H-T-B;ctx.fillStyle='#1e2a4a';ctx.font='13px Segoe UI';ctx.textAlign='center';ctx.fillText(ser.map(s=>s.n).join(', ')+(lab!==undefined?' by '+tb.cols[lab]:''),W/2,25);ctx.strokeStyle='#e3e7f0';ctx.fillStyle='#666';ctx.font='9px Segoe UI';for(let i=0;i<6;i++){let v=lo+(hi-lo)*i/5,y=T+ph-(v-lo)/(hi-lo)*ph;ctx.beginPath();ctx.moveTo(L,y);ctx.lineTo(L+pw,y);ctx.stroke();ctx.textAlign='right';ctx.fillText(v.toPrecision(4),L-5,y+3)}let kind=$('ctype').value;if(kind==='Pie'){let s=ser[0],tot=s.v.reduce((a,b)=>a+Math.max(0,b),0)||1,cx=L+pw/2,cy=T+ph/2,rr=Math.min(pw,ph)/2.5,a=-Math.PI/2;labels.forEach((k,i)=>{let q=Math.max(0,s.v[i])/tot*2*Math.PI;ctx.beginPath();ctx.moveTo(cx,cy);ctx.arc(cx,cy,rr,a,a+q);ctx.closePath();ctx.fillStyle=['#2f6fed','#f5a623','#22b07d','#e8504f','#8e5cf7','#17a2b8','#d6409f','#7f8c7d'][i%8];ctx.fill();a+=q});return}let gw=pw/labels.length;ser.forEach((s,si)=>{ctx.fillStyle=['#2f6fed','#f5a623','#22b07d'][si];ctx.strokeStyle=ctx.fillStyle;ctx.lineWidth=2;let pts=[];s.v.forEach((v,i)=>{let x=L+i*gw+gw/2,y=T+ph-(v-lo)/(hi-lo);if(kind==='Bar'){let bw=gw*.72/ser.length,x0=L+i*gw+gw*.14+si*bw;ctx.fillRect(x0,y,bw,T+ph-y)}else pts.push([x,y])});if(kind==='Line'&&pts.length){ctx.beginPath();pts.forEach((p,i)=>i?ctx.lineTo(...p):ctx.moveTo(...p));ctx.stroke()}});ctx.fillStyle='#555';ctx.font='9px Segoe UI';ctx.textAlign='center';labels.forEach((x,i)=>ctx.fillText(x.slice(0,15),L+i*gw+gw/2,H-48))}
-window.onresize=()=>{if(window.innerWidth<=900){$('workspace').style.gridTemplateColumns='1fr';$('workspace').style.gridTemplateRows='auto 7px auto'}drawChart()};$('workspace').ondragover=e=>{e.preventDefault();$('workspace').classList.add('drop')};$('workspace').ondragleave=()=>$('workspace').classList.remove('drop');$('workspace').ondrop=e=>{e.preventDefault();$('workspace').classList.remove('drop');$('files').files=e.dataTransfer.files;$('files').dispatchEvent(new Event('change'))};
-</script></body></html>"""
+
+async function selectSheet(name){
+  try{
+    let r=await fetch('/sheet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})}),d=await r.json();
+    if(!r.ok)throw Error(d.error);
+    render(d);
+    msg(d.status);
+  }catch(x){msg(x.message)}
+}
+
+async function analyze(){
+  let p=$('prompt').value.trim();
+  if(!p){msg('Type a request first.');return}
+  msg('Analyzing…');
+  try{
+    let r=await fetch('/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p,chain:$('chain').checked})}),d=await r.json();
+    if(!r.ok)throw Error(d.error);
+    render(d);
+    msg(d.status);
+  }catch(x){msg(x.message)}
+}
+
+async function resetApp(){
+  let r=await fetch('/reset',{method:'POST'}),d=await r.json();
+  render(d);
+  msg(d.status);
+}
+
+function render(d){
+  state=d;
+  let s=$('sheet');
+  s.innerHTML='';
+  (d.sheets||[]).forEach(n=>{
+    let o=document.createElement('option');
+    o.value=n;
+    o.textContent=n;
+    s.appendChild(o);
+  });
+  if(d.selected)s.value=d.selected;
+  $('info').textContent=d.result?`${d.result.row_count} rows × ${d.result.col_count} cols${d.result.truncated?'  (showing first 5000)':''} | drag header edges to resize`: 'No file loaded';
+  let tb=d.result;
+  if(!tb||!tb.cols.length){
+    $('tablewrap').innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted py-5">Load data to see the table</div>';
+  }else{
+    let colgroup='<colgroup>'+tb.cols.map((c,i)=>`<col data-col="${i}" style="width:${columnWidths[i]||140}px">`).join('')+'</colgroup>';
+    let heads=tb.cols.map((c,i)=>`<th data-col="${i}" onclick="sortCol(${i})" class="position-relative text-nowrap">${esc(c)} ${sorts[i]===true?'↓':sorts[i]===false?'↑':''}<span class="col-resizer" onmousedown="startColumnResize(event,${i})"></span></th>`).join('');
+    $('tablewrap').innerHTML=`<table class="table table-sm table-striped table-hover table-bordered table-custom align-middle mb-0">${colgroup}<thead><tr>${heads}</tr></thead><tbody>${tb.rows.map(r=>'<tr>'+r.map(v=>`<td>${esc(v)}</td>`).join('')+'</tr>').join('')}</tbody></table>`;
+  }
+  $('insights').textContent=(d.steps||[]).map((x,i)=>`${i+1}. ${x}`).join('\n')+(d.stats||'');
+  drawChart();
+}
+
+async function sortCol(i){
+  sorts[i]=!sorts[i];
+  let r=await fetch('/sort',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i,desc:sorts[i]})}),d=await r.json();
+  render(d);
+}
+
+function show(x){
+  $('table').classList.toggle('active',x==='table');$('chart').classList.toggle('active',x==='chart');
+  $('btn-tab-table').classList.toggle('active',x==='table');$('btn-tab-chart').classList.toggle('active',x==='chart');
+}
+
+function startColumnResize(e,i){
+  e.preventDefault();
+  e.stopPropagation();
+  let th=e.currentTarget.parentElement,startX=e.clientX,startW=th.getBoundingClientRect().width;
+  th.classList.add('resizing');
+  document.body.style.userSelect='none';
+  let move=ev=>{
+    let w=Math.max(55,startW+(ev.clientX-startX));
+    columnWidths[i]=Math.round(w);
+    let col=document.querySelector(`col[data-col="${i}"]`);
+    if(col)col.style.width=columnWidths[i]+'px';
+  };
+  let up=()=>{
+    th.classList.remove('resizing');
+    document.body.style.userSelect='';
+    document.removeEventListener('mousemove',move);
+    document.removeEventListener('mouseup',up);
+    msg(`Column ${i+1} width adjusted.`);
+  };
+  document.addEventListener('mousemove',move);
+  document.addEventListener('mouseup',up);
+}
+
+function drawChart(){
+  let c=$('cv'),ctx=c.getContext('2d'),tb=state&&state.result;
+  if(!tb||!tb.rows.length)return;
+  let r=c.getBoundingClientRect(),D=devicePixelRatio||1;
+  c.width=Math.max(300,r.width*D);
+  c.height=Math.max(280,r.height*D);
+  ctx.setTransform(D,0,0,D,0,0);
+  let W=r.width,H=r.height;
+  ctx.clearRect(0,0,W,H);
+  let nums=[],texts=[];
+  tb.cols.forEach((x,j)=>{
+    let n=tb.rows.filter(a=>typeof a[j]==='number').length,e=tb.rows.filter(a=>String(a[j])!=='').length;
+    if(e&&n>=.6*e)nums.push(j);else texts.push(j);
+  });
+  let lab=texts.find(j=>new Set(tb.rows.map(a=>String(a[j]))).size<=30);
+  let vs=nums.filter(j=>j!==lab).slice(0,3);
+  if(!vs.length)vs=[null];
+  let labels=[],m=new Map();
+  tb.rows.forEach((a,i)=>{
+    let k=lab===undefined?String(i+1):String(a[lab]);
+    if(!m.has(k)){m.set(k,vs.map(()=>0));labels.push(k)}
+    vs.forEach((j,z)=>m.get(k)[z]+=j===null?1:(typeof a[j]==='number'?a[j]:0));
+  });
+  if(labels.length>30){
+    let ix=labels.map((x,i)=>i).sort((a,b)=>m.get(labels[b])[0]-m.get(labels[a])[0]).slice(0,30);
+    labels=ix.map(i=>labels[i]);
+  }
+  let ser=vs.map((j,z)=>({n:j===null?'Count':tb.cols[j],v:labels.map(k=>m.get(k)[z])})),all=ser.flatMap(s=>s.v),lo=Math.min(0,...all),hi=Math.max(1,...all),L=55,R=20,T=40,B=60,pw=W-L-R,ph=H-T-B;
+  ctx.fillStyle='#1e293b';
+  ctx.font='600 12px system-ui';
+  ctx.textAlign='center';
+  ctx.fillText(ser.map(s=>s.n).join(', ')+(lab!==undefined?' by '+tb.cols[lab]:''),W/2,20);
+  ctx.strokeStyle='#e2e8f0';
+  ctx.fillStyle='#64748b';
+  ctx.font='10px system-ui';
+  for(let i=0;i<6;i++){
+    let v=lo+(hi-lo)*i/5,y=T+ph-(v-lo)/(hi-lo)*ph;
+    ctx.beginPath();
+    ctx.moveTo(L,y);
+    ctx.lineTo(L+pw,y);
+    ctx.stroke();
+    ctx.textAlign='right';
+    ctx.fillText(v.toPrecision(3),L-5,y+3);
+  }
+  let kind=$('ctype').value;
+  if(kind==='Pie'){
+    let s=ser[0],tot=s.v.reduce((a,b)=>a+Math.max(0,b),0)||1,cx=L+pw/2,cy=T+ph/2,rr=Math.min(pw,ph)/2.5,a=-Math.PI/2;
+    labels.forEach((k,i)=>{
+      let q=Math.max(0,s.v[i])/tot*2*Math.PI;
+      ctx.beginPath();
+      ctx.moveTo(cx,cy);
+      ctx.arc(cx,cy,rr,a,a+q);
+      ctx.closePath();
+      ctx.fillStyle=['#0d6efd','#f59e0b','#10b981','#ef4444','#8b5cf6','#06b6d4','#ec4899','#64748b'][i%8];
+      ctx.fill();
+      a+=q;
+    });
+    return;
+  }
+  let gw=pw/labels.length;
+  ser.forEach((s,si)=>{
+    ctx.fillStyle=['#0d6efd','#f59e0b','#10b981'][si%3];
+    ctx.strokeStyle=ctx.fillStyle;
+    ctx.lineWidth=2;
+    let pts=[];
+    s.v.forEach((v,i)=>{
+      let x=L+i*gw+gw/2,y=T+ph-(v-lo)/(hi-lo)*ph;
+      if(kind==='Bar'){
+        let bw=gw*.7/ser.length,x0=L+i*gw+gw*.15+si*bw;
+        ctx.fillRect(x0,y,bw,T+ph-y);
+      }else pts.push([x,y]);
+    });
+    if(kind==='Line'&&pts.length){
+      ctx.beginPath();
+      pts.forEach((p,i)=>i?ctx.lineTo(...p):ctx.moveTo(...p));
+      ctx.stroke();
+    }
+  });
+  ctx.fillStyle='#475569';
+  ctx.font='10px system-ui';
+  ctx.textAlign='center';
+  labels.forEach((x,i)=>ctx.fillText(x.slice(0,12),L+i*gw+gw/2,H-40));
+}
+
+window.onresize=()=>drawChart();
+
+let ws=$('workspace');
+ws.ondragover=e=>{e.preventDefault();ws.classList.add('drop')};
+ws.ondragleave=()=>ws.classList.remove('drop');
+ws.ondrop=e=>{
+  e.preventDefault();
+  ws.classList.remove('drop');
+  $('files').files=e.dataTransfer.files;
+  $('files').dispatchEvent(new Event('change'));
+};
+</script>
+</body>
+</html>"""
 
 class WebHandler(BaseHTTPRequestHandler):
     protocol_version='HTTP/1.1'
