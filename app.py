@@ -1711,9 +1711,8 @@ STATE={'sheets':{},'base':None,'result':None,'steps':[],'prompt_used':'','select
 
 
 HTML = r"""<!doctype html>
-
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Excel Intelligence</title>
-
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <style>
 
 *{box-sizing:border-box}html,body{height:100%;margin:0;font-family:"Segoe UI",Arial,sans-serif;background:#eef1f7;color:#111827}body{overflow:hidden;min-width:1050px}
